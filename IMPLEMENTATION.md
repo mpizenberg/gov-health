@@ -9,7 +9,7 @@ Extracts data from a yaci-store PostgreSQL database into Parquet files for analy
 cd /Users/piz/git/bloxbean/gov-health
 
 # Install
-uv sync
+uv sync --extra duckdb
 
 # Configure database connection
 cp .env.example .env
