@@ -59,43 +59,44 @@ class GovActionLifecycle(SingleFileDataset):
               s.status,
               s.epoch_resolved,
               -- CC voting stats
-              (gap.voting_stats->'cc'->>'yes')::int AS cc_yes,
-              (gap.voting_stats->'cc'->>'no')::int AS cc_no,
-              (gap.voting_stats->'cc'->>'abstain')::int AS cc_abstain,
-              (gap.voting_stats->'cc'->>'do_not_vote')::int AS cc_do_not_vote,
-              (gap.voting_stats->'cc'->>'approval_ratio')::float8 AS cc_approval_ratio,
+              (s.voting_stats->'cc'->>'yes')::int AS cc_yes,
+              (s.voting_stats->'cc'->>'no')::int AS cc_no,
+              (s.voting_stats->'cc'->>'abstain')::int AS cc_abstain,
+              (s.voting_stats->'cc'->>'do_not_vote')::int AS cc_do_not_vote,
+              (s.voting_stats->'cc'->>'approval_ratio')::float8 AS cc_approval_ratio,
               -- DRep voting stats
-              (gap.voting_stats->'drep'->>'yes_vote_stake')::bigint AS drep_yes_vote_stake,
-              (gap.voting_stats->'drep'->>'no_vote_stake')::bigint AS drep_no_vote_stake,
-              (gap.voting_stats->'drep'->>'abstain_vote_stake')::bigint AS drep_abstain_vote_stake,
-              (gap.voting_stats->'drep'->>'no_confidence_stake')::bigint AS drep_no_confidence_stake,
-              (gap.voting_stats->'drep'->>'auto_abstain_stake')::bigint AS drep_auto_abstain_stake,
-              (gap.voting_stats->'drep'->>'do_not_vote_stake')::bigint AS drep_do_not_vote_stake,
-              (gap.voting_stats->'drep'->>'total_yes_stake')::bigint AS drep_total_yes_stake,
-              (gap.voting_stats->'drep'->>'total_no_stake')::bigint AS drep_total_no_stake,
-              (gap.voting_stats->'drep'->>'total_abstain_stake')::bigint AS drep_total_abstain_stake,
-              (gap.voting_stats->'drep'->>'approval_ratio')::float8 AS drep_approval_ratio,
+              (s.voting_stats->'drep'->>'yes_vote_stake')::bigint AS drep_yes_vote_stake,
+              (s.voting_stats->'drep'->>'no_vote_stake')::bigint AS drep_no_vote_stake,
+              (s.voting_stats->'drep'->>'abstain_vote_stake')::bigint AS drep_abstain_vote_stake,
+              (s.voting_stats->'drep'->>'no_confidence_stake')::bigint AS drep_no_confidence_stake,
+              (s.voting_stats->'drep'->>'auto_abstain_stake')::bigint AS drep_auto_abstain_stake,
+              (s.voting_stats->'drep'->>'do_not_vote_stake')::bigint AS drep_do_not_vote_stake,
+              (s.voting_stats->'drep'->>'total_yes_stake')::bigint AS drep_total_yes_stake,
+              (s.voting_stats->'drep'->>'total_no_stake')::bigint AS drep_total_no_stake,
+              (s.voting_stats->'drep'->>'total_abstain_stake')::bigint AS drep_total_abstain_stake,
+              (s.voting_stats->'drep'->>'approval_ratio')::float8 AS drep_approval_ratio,
               -- SPO voting stats
-              (gap.voting_stats->'spo'->>'yes_vote_stake')::bigint AS spo_yes_vote_stake,
-              (gap.voting_stats->'spo'->>'no_vote_stake')::bigint AS spo_no_vote_stake,
-              (gap.voting_stats->'spo'->>'abstain_vote_stake')::bigint AS spo_abstain_vote_stake,
-              (gap.voting_stats->'spo'->>'do_not_vote_stake')::bigint AS spo_do_not_vote_stake,
-              (gap.voting_stats->'spo'->>'total_yes_stake')::bigint AS spo_total_yes_stake,
-              (gap.voting_stats->'spo'->>'total_no_stake')::bigint AS spo_total_no_stake,
-              (gap.voting_stats->'spo'->>'total_abstain_stake')::bigint AS spo_total_abstain_stake,
-              (gap.voting_stats->'spo'->>'approval_ratio')::float8 AS spo_approval_ratio,
+              (s.voting_stats->'spo'->>'yes_vote_stake')::bigint AS spo_yes_vote_stake,
+              (s.voting_stats->'spo'->>'no_vote_stake')::bigint AS spo_no_vote_stake,
+              (s.voting_stats->'spo'->>'abstain_vote_stake')::bigint AS spo_abstain_vote_stake,
+              (s.voting_stats->'spo'->>'do_not_vote_stake')::bigint AS spo_do_not_vote_stake,
+              (s.voting_stats->'spo'->>'total_yes_stake')::bigint AS spo_total_yes_stake,
+              (s.voting_stats->'spo'->>'total_no_stake')::bigint AS spo_total_no_stake,
+              (s.voting_stats->'spo'->>'total_abstain_stake')::bigint AS spo_total_abstain_stake,
+              (s.voting_stats->'spo'->>'approval_ratio')::float8 AS spo_approval_ratio,
               -- epoch for incremental tracking (use latest status epoch, or proposed epoch)
               COALESCE(s.epoch_resolved, gap.epoch) AS epoch
             FROM gov_action_proposal gap
             LEFT JOIN LATERAL (
               SELECT
                 gps.status,
+                gps.voting_stats,
                 CASE WHEN gps.status IN ('RATIFIED', 'EXPIRED', 'ENACTED', 'DROPPED')
                      THEN gps.epoch ELSE NULL END AS epoch_resolved
               FROM gov_action_proposal_status gps
               WHERE gps.gov_action_tx_hash = gap.tx_hash
                 AND gps.gov_action_index = gap.idx
-              ORDER BY gps.epoch DESC, gps.id DESC LIMIT 1
+              ORDER BY gps.epoch DESC LIMIT 1
             ) s ON true
             WHERE gap.epoch = ANY(%(epochs)s)
                OR (s.status IS NULL OR s.status NOT IN ('RATIFIED', 'EXPIRED', 'ENACTED', 'DROPPED'))

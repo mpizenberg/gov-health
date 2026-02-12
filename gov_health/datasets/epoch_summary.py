@@ -82,8 +82,7 @@ class EpochSummary(SingleFileDataset):
                 c.threshold AS cc_threshold
               FROM committee_member cmm
               CROSS JOIN LATERAL (
-                SELECT (threshold->>'numerator')::float
-                  / NULLIF((threshold->>'denominator')::float, 0) AS threshold
+                SELECT threshold
                 FROM committee ORDER BY epoch DESC LIMIT 1
               ) c
               WHERE cmm.start_epoch <= e.number
