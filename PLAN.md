@@ -476,3 +476,64 @@ The second layer of the pipeline: DuckDB views that compute each KPI as a per-ep
 | 1.4 New vs Returning Delegators | Needs per-address Ada balances (not in current extraction) |
 | 1.6 Stake Registration Rate | Needs `stake_registration` events (not yet extracted) |
 | 1.7 Future Delegation Status | Complex cross-correlation of delegation status with activity predictions |
+
+---
+
+## Superset Stack
+
+Docker Compose stack providing Apache Superset with a DuckDB backend, mirroring the proven setup from `ys-to-parquet`.
+
+### Architecture
+
+```
+superset/
+├── docker-compose.yml         # 3 services: superset, superset-db, superset-redis
+├── Dockerfile                 # apache/superset:6.0.0 + duckdb-engine
+├── requirements-local.txt     # duckdb, duckdb-engine, psycopg2-binary
+├── superset_config.py         # Metadata DB, cache, PREVENT_UNSAFE_DB_CONNECTIONS
+├── bootstrap.sh               # Creates DuckDB views + registers database in Superset
+└── .env                       # COMPOSE_PROJECT_NAME, SUPERSET_SECRET_KEY
+```
+
+### Services
+
+| Service | Image | Purpose |
+|---------|-------|---------|
+| `superset` | Custom (apache/superset:6.0.0) | Superset web UI on port 8088 |
+| `superset-db` | postgres:16-alpine | Superset metadata store |
+| `superset-redis` | redis:7-alpine | Cache + Celery broker |
+
+### Volumes
+
+- `../output` → `/data` — parquet files + governance.duckdb
+- `../gov_health` → `/app/gov_health` — KPI view SQL (single source of truth)
+
+### Bootstrap (idempotent, runs on every container start)
+
+1. **DuckDB views** — auto-discovers parquet files under `/data`, creates base views, then imports `ALL_KPI_VIEWS` from mounted `gov_health.kpis`
+2. **Superset init** — creates admin user (admin/admin), runs migrations, syncs permissions
+3. **Database registration** — upserts `Cardano Governance (DuckDB)` datasource with URI `duckdb:////data/governance.duckdb?access_mode=READ_ONLY`
+
+### Usage
+
+```bash
+cd superset
+docker compose up --build     # http://localhost:8088 (admin / admin)
+```
+
+---
+
+## Next: KPI Data Debugging
+
+**Priority task.** KPI 1.1 (voting turnout) returns 0 rows, indicating either:
+- `gov_action_lifecycle.drep_yes_vote_stake` is NULL for all rows (voting_stats JSONB not populated in yaci-store)
+- The extraction query for lifecycle voting stats has a bug
+- yaci-store configuration issue (voting stats computation may need to be enabled)
+
+### Debugging plan
+
+1. Check raw `gov_action_lifecycle.parquet` — are drep stake columns all NULL?
+2. If NULL: query yaci-store `gov_action_proposal.voting_stats` JSONB directly to see what's there
+3. If JSONB is empty: yaci-store may not compute voting stats — check yaci-store config / version
+4. If JSONB has data but extraction is wrong: fix the JSONB field path in `gov_action_lifecycle.py`
+5. Validate remaining KPIs (1.2, 1.3, 1.5, 1.8) produce sensible values

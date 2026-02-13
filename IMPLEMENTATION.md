@@ -58,6 +58,13 @@ gov-health/
 │       ├── delegation_events.py        # 6. Raw delegation-vote events
 │       ├── cc_vote_details.py          # 7. CC member votes + hot→cold key mapping
 │       └── governance_params.py        # 8. Protocol governance params per epoch
+├── superset/
+│   ├── docker-compose.yml             # superset + superset-db + superset-redis
+│   ├── Dockerfile                     # apache/superset:6.0.0 + duckdb-engine
+│   ├── requirements-local.txt         # duckdb, duckdb-engine, psycopg2-binary
+│   ├── superset_config.py             # Metadata DB, cache, Celery config
+│   ├── bootstrap.sh                   # DuckDB views + admin user + DB registration
+│   └── .env                           # COMPOSE_PROJECT_NAME, SUPERSET_SECRET_KEY
 └── output/                             # Generated parquet files (gitignored)
 ```
 
@@ -185,3 +192,28 @@ The second layer on top of the base Parquet views. Each KPI is a `CREATE OR REPL
 | 1.4 New vs Returning Delegators | Needs per-address Ada balances |
 | 1.6 Stake Registration Rate | Needs `stake_registration` events |
 | 1.7 Future Delegation Status | Complex cross-correlation, deferred |
+
+## Superset Stack
+
+Docker Compose stack in `superset/` providing Apache Superset with DuckDB backend (mirrored from ys-to-parquet).
+
+```
+superset/
+├── docker-compose.yml         # superset + superset-db + superset-redis
+├── Dockerfile                 # apache/superset:6.0.0 + duckdb-engine
+├── requirements-local.txt     # duckdb 1.4.4, duckdb-engine 0.17.0, psycopg2-binary
+├── superset_config.py         # Metadata DB (Postgres), Redis cache, PREVENT_UNSAFE_DB_CONNECTIONS=False
+├── bootstrap.sh               # DuckDB views + admin user + database registration
+└── .env                       # COMPOSE_PROJECT_NAME, SUPERSET_SECRET_KEY
+```
+
+**Key details:**
+- Mounts `../output` → `/data` (parquet files) and `../gov_health` → `/app/gov_health` (KPI SQL — single source of truth)
+- `bootstrap.sh` auto-discovers parquet files for base views, imports `ALL_KPI_VIEWS` from mounted package for KPI views
+- Database registered as `Cardano Governance (DuckDB)` with URI `duckdb:////data/governance.duckdb?access_mode=READ_ONLY`
+- Admin credentials: admin / admin
+- Start: `cd superset && docker compose up --build` → http://localhost:8088
+
+## Known Issues / Next Steps
+
+- **KPI 1.1 returns 0 rows** — `drep_yes_vote_stake` columns in `gov_action_lifecycle` appear to be all NULL. Needs investigation: check yaci-store `gov_action_proposal.voting_stats` JSONB contents, verify extraction JSONB field paths, and check yaci-store configuration for voting stats computation.

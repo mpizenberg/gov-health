@@ -1,0 +1,42 @@
+services:
+  superset:
+    build: .
+    ports:
+      - "8088:8088"
+    depends_on:
+      superset-db:
+        condition: service_healthy
+      superset-redis:
+        condition: service_healthy
+    volumes:
+      - ../output:/data
+      - ../gov_health:/app/gov_health
+    environment:
+      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY}
+    command: >
+      bash -c "/app/bootstrap.sh && superset run -h 0.0.0.0 -p 8088"
+
+  superset-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: superset
+      POSTGRES_USER: superset
+      POSTGRES_PASSWORD: superset
+    volumes:
+      - superset-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superset"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  superset-redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  superset-db-data:
