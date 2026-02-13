@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from gov_health.kpis import ALL_KPI_VIEWS
+
 
 # Epoch-partitioned datasets use hive partitioning glob
 EPOCH_PARTITIONED = [
@@ -47,6 +49,10 @@ def create_views(*, parquet_dir: str = "output", db_path: str = "output/governan
             print(f"  view: {name}")
         else:
             print(f"  skip: {name} (file not found)")
+
+    for name, sql in ALL_KPI_VIEWS:
+        conn.execute(sql)
+        print(f"  view: {name} (kpi)")
 
     conn.close()
     print(f"DuckDB database: {db_path}")

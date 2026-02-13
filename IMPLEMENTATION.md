@@ -44,6 +44,9 @@ gov-health/
 │   ├── db.py                           # Connection factory + epoch discovery
 │   ├── extract.py                      # Orchestration loop
 │   ├── views.py                        # DuckDB view creation
+│   ├── kpis/
+│   │   ├── __init__.py               # ALL_KPI_VIEWS registry
+│   │   └── category_1.py            # Cat 1: Ada Holder Participation (5 views)
 │   └── datasets/
 │       ├── __init__.py                 # ALL_DATASETS registry (list of 8)
 │       ├── base.py                     # EpochPartitionedDataset, SingleFileDataset
@@ -153,3 +156,32 @@ Governance-relevant protocol parameters per epoch from `epoch_param.params` JSON
 6. **Incremental by default** — only new/unsettled epochs processed. `--full` for complete re-extraction.
 7. **Empty epoch skip** — epoch-partitioned datasets write no file for epochs with zero rows.
 8. **Lifecycle dedup** — `gov_action_lifecycle` deduplicates by `(tx_hash, index)` primary key rather than by epoch, and always re-fetches actions that haven't reached terminal status.
+
+## KPI Analytic Views
+
+The second layer on top of the base Parquet views. Each KPI is a `CREATE OR REPLACE VIEW` in DuckDB that computes a per-epoch time-series from one or more base views. Created automatically by `create-views` — no CLI changes needed.
+
+### Architecture
+
+- **`gov_health/kpis/`** — one module per KPI category, each exporting a `CATEGORY_N_VIEWS` list of `(view_name, create_sql)` tuples
+- **`kpis/__init__.py`** — collects all category lists into `ALL_KPI_VIEWS` (mirrors `datasets/__init__.py`)
+- **`views.py`** — iterates `ALL_KPI_VIEWS` after base views, executing each SQL
+- **Naming**: `kpi_<category>_<number>_<short_name>` (e.g. `kpi_1_3_delegation_rate`)
+
+### Category 1 — Ada Holder Participation (5 implemented)
+
+| View | KPI | Description | Base Views Used |
+|------|-----|-------------|-----------------|
+| `kpi_1_1_voting_turnout` | 1.1 | DRep voting turnout as % of circulating Ada | `gov_action_lifecycle`, `epoch_summary` |
+| `kpi_1_2_active_stake_participation` | 1.2 | Distinct delegating addresses per epoch + cumulative | `delegation_events` |
+| `kpi_1_3_delegation_rate` | 1.3 | Total delegated Ada as % of circulation | `epoch_summary` |
+| `kpi_1_5_delegation_churn` | 1.5 | DRep re-delegations detected via LAG() window | `delegation_events` |
+| `kpi_1_8_inactive_delegated_ada` | 1.8 | Ada delegated to retired/expired DReps | `drep_epoch_stats` |
+
+### Deferred (3 KPIs)
+
+| KPI | Reason |
+|-----|--------|
+| 1.4 New vs Returning Delegators | Needs per-address Ada balances |
+| 1.6 Stake Registration Rate | Needs `stake_registration` events |
+| 1.7 Future Delegation Status | Complex cross-correlation, deferred |

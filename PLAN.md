@@ -443,3 +443,36 @@ SELECT epoch, treasury, treasury - LAG(treasury) OVER (ORDER BY epoch) AS delta
 FROM epoch_summary;
 SQL
 ```
+
+---
+
+## KPI Analytic Views
+
+The second layer of the pipeline: DuckDB views that compute each KPI as a per-epoch time-series, ready for Superset charting. Views are `CREATE OR REPLACE VIEW` (idempotent) and are created automatically by the existing `create-views` CLI command.
+
+### Architecture
+
+- **Location**: `gov_health/kpis/` package, one module per category
+- **Registry**: `kpis/__init__.py` collects `ALL_KPI_VIEWS` from all category modules (mirrors `datasets/__init__.py` pattern)
+- **Format**: Each KPI is a `(view_name, create_sql)` tuple
+- **Naming convention**: `kpi_<category>_<number>_<short_name>` (e.g. `kpi_1_1_voting_turnout`)
+- **Integration**: `views.py` iterates `ALL_KPI_VIEWS` after creating base views — no CLI changes needed
+- **Superset**: KPI views appear as datasets via `duckdb:///` SQLAlchemy URI
+
+### Category 1 — Ada Holder Participation (5 views)
+
+| View | KPI | SQL Logic |
+|------|-----|-----------|
+| `kpi_1_1_voting_turnout` | 1.1 Voting Turnout (% Ada) | `gov_action_lifecycle` DRep stake totals / `epoch_summary.circulation`, grouped by `epoch_proposed` |
+| `kpi_1_2_active_stake_participation` | 1.2 Active Stake Address Participation | `COUNT(DISTINCT address)` from `delegation_events` per epoch + cumulative unique addresses |
+| `kpi_1_3_delegation_rate` | 1.3 Delegation Rate (% Ada) | `epoch_summary.total_drep_delegated / circulation` |
+| `kpi_1_5_delegation_churn` | 1.5 Delegation Churn | `LAG()` window over `delegation_events` to detect DRep changes per address |
+| `kpi_1_8_inactive_delegated_ada` | 1.8 Inactive Delegated Ada | `drep_epoch_stats` where `status='RETIRED'` or `epoch > active_until`, summing `delegated_amount` |
+
+### Deferred KPIs
+
+| KPI | Reason |
+|-----|--------|
+| 1.4 New vs Returning Delegators | Needs per-address Ada balances (not in current extraction) |
+| 1.6 Stake Registration Rate | Needs `stake_registration` events (not yet extracted) |
+| 1.7 Future Delegation Status | Complex cross-correlation of delegation status with activity predictions |
