@@ -1,7 +1,7 @@
 # Implementation Notes
 
-Governance health Parquet extraction pipeline, built from the plan in `PLAN.md`.
-Extracts data from a yaci-store PostgreSQL database into Parquet files for analysis via DuckDB / Apache Superset.
+Governance health analytics pipeline — Parquet-to-Parquet via DuckDB.
+Reads yaci-store Parquet exports directly (no PostgreSQL required) and builds analytics Parquet files for analysis via DuckDB / Apache Superset.
 
 ## Quick Start
 
@@ -9,11 +9,11 @@ Extracts data from a yaci-store PostgreSQL database into Parquet files for analy
 cd /Users/piz/git/bloxbean/gov-health
 
 # Install
-uv sync --extra duckdb
+uv sync
 
-# Configure database connection
+# Place yaci-store parquet export in data/analytics/main/
+# (or set SOURCE_DATA_DIR in .env to point elsewhere)
 cp .env.example .env
-# Edit .env with your yaci-store credentials
 
 # Extract all datasets
 uv run gov-health extract
@@ -24,6 +24,9 @@ uv run gov-health extract --only drep_epoch_stats
 # Full re-extraction (ignore existing files)
 uv run gov-health extract --full
 
+# Point to a different source directory
+uv run gov-health extract --source /path/to/parquet/export
+
 # Create DuckDB views over the parquet files
 uv run gov-health create-views
 ```
@@ -33,15 +36,15 @@ uv run gov-health create-views
 ```
 gov-health/
 ├── pyproject.toml                      # Python 3.11+, hatchling build
-├── .env.example                        # DB connection template
-├── .gitignore                          # Excludes output/, .env, .venv/
-├── ANALYSIS.md                         # KPI + schema reference (pre-existing)
-├── PLAN.md                             # Original design plan (pre-existing)
+├── .env.example                        # SOURCE_DATA_DIR config
+├── .gitignore                          # Excludes output/, data/, .env, .venv/
+├── ANALYSIS.md                         # KPI + schema reference
+├── PLAN.md                             # Design plan
 ├── gov_health/
 │   ├── __init__.py
 │   ├── cli.py                          # Click CLI entry point
-│   ├── config.py                       # Env-var based DB config
-│   ├── db.py                           # Connection factory + epoch discovery
+│   ├── config.py                       # SOURCE_DATA_DIR + OUTPUT_DIR config
+│   ├── db.py                           # DuckDB connection + source table registration
 │   ├── extract.py                      # Orchestration loop
 │   ├── views.py                        # DuckDB view creation
 │   ├── kpis/
@@ -53,11 +56,32 @@ gov-health/
 │       ├── drep_epoch_stats.py         # 1. DRep per-epoch delegation + voting
 │       ├── pool_epoch_stats.py         # 2. Pool per-epoch stats + default stance
 │       ├── gov_action_votes.py         # 3. Individual vote records
-│       ├── gov_action_lifecycle.py     # 4. Action lifecycle + JSONB voting stats
+│       ├── gov_action_lifecycle.py     # 4. Action lifecycle + voting stats
 │       ├── epoch_summary.py            # 5. Per-epoch aggregates + denominators
 │       ├── delegation_events.py        # 6. Raw delegation-vote events
 │       ├── cc_vote_details.py          # 7. CC member votes + hot→cold key mapping
 │       └── governance_params.py        # 8. Protocol governance params per epoch
+├── data/
+│   └── analytics/main/                 # Yaci-store Parquet export (gitignored)
+│       ├── adapot/
+│       ├── block/
+│       ├── committee/
+│       ├── committee_member/
+│       ├── committee_registration/
+│       ├── delegation_vote/
+│       ├── drep/
+│       ├── drep_dist/
+│       ├── drep_registration/
+│       ├── epoch_param/
+│       ├── epoch_stake/
+│       ├── gov_action_proposal/
+│       ├── gov_action_proposal_status/
+│       ├── gov_epoch_activity/
+│       ├── pool/
+│       ├── pool_registration/
+│       ├── transaction/
+│       ├── voting_procedure/
+│       └── ...                         # 46 tables total
 ├── superset/
 │   ├── docker-compose.yml             # superset + superset-db + superset-redis
 │   ├── Dockerfile                     # apache/superset:6.0.0 + duckdb-engine
@@ -72,20 +96,31 @@ gov-health/
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| psycopg[binary] | >=3.1 | PostgreSQL driver (psycopg 3, dict_row) |
-| pyarrow | >=18.0 | Parquet read/write, Arrow tables |
+| duckdb | >=1.1 | SQL engine — reads source parquet, writes output parquet |
+| pyarrow | >=18.0 | Parquet read/write, Arrow table merges |
 | click | >=8.0 | CLI framework |
 | tqdm | >=4.0 | Progress bars during extraction |
-| python-dotenv | >=1.0 | Load .env for DB credentials |
-| duckdb | >=1.1 | Optional — only needed for `create-views` |
+| python-dotenv | >=1.0 | Load .env for config |
 
 ## Architecture
+
+### Data Flow
+
+```
+yaci-store Parquet export (data/analytics/main/)
+  → DuckDB SQL transforms (in-memory)
+    → output Parquet files (output/)
+      → DuckDB views + KPI views (output/governance.duckdb)
+        → Apache Superset dashboards
+```
+
+No PostgreSQL connection is needed. The source data is a yaci-store Parquet export with Hive-style partitioning (`date=YYYY-MM-DD` or `epoch=NNN`). DuckDB reads these directly via `read_parquet()` with `hive_partitioning=true`.
 
 ### Two Storage Strategies
 
 **Epoch-partitioned** — one file per epoch in a hive-partitioned directory:
 - `output/drep_epoch_stats/epoch=520.parquet`
-- Settled epochs (end_time older than 24h) are never rewritten
+- Settled epochs (present in `adapot`) are never rewritten
 - The current unsettled epoch is rewritten on every run (`force=True`)
 - Empty epochs produce no file (skipped)
 
@@ -96,50 +131,52 @@ gov-health/
 
 ### Core Modules
 
-**`config.py`** — reads six env vars (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SCHEMA`) with sensible defaults. Defines `SETTLEMENT_SECONDS = 86400`.
+**`config.py`** — reads `SOURCE_DATA_DIR` (default: `data/analytics/main`) and defines `OUTPUT_DIR`.
 
-**`db.py`** — three discovery functions on top of a psycopg3 connection:
-- `get_connection()` — sets `search_path=yaci_store,public`, returns `dict_row` connection
-- `get_settled_epochs(conn)` — epochs with `end_time < now() - 86400`
-- `get_max_epoch(conn)` — highest epoch number
+**`db.py`** — DuckDB source connection management:
+- `get_connection()` — creates an in-memory DuckDB connection and registers all source parquet table directories as views (auto-detects Hive partitioning)
+- `get_settled_epochs(conn)` — all distinct epochs in `adapot` (proxy for settled)
+- `get_max_epoch(conn)` — highest epoch in `adapot`
 - `get_conway_start_epoch(conn)` — first epoch with `drep_dist` data (skips pre-governance eras)
 
 **`datasets/base.py`** — two abstract base classes:
-- `EpochPartitionedDataset` — subclasses implement `schema()` and `query_epoch(epoch) -> (sql, params)`
-- `SingleFileDataset` — subclasses implement `schema()` and `query_epochs(epochs) -> (sql, params)`
-- Both handle parquet I/O internally: `pa.Table.from_pylist()` + `pq.write_table()`, with `pa.concat_tables()` for merges
+- `EpochPartitionedDataset` — subclasses implement `query_epoch(epoch) -> str` returning DuckDB SQL
+- `SingleFileDataset` — subclasses implement `query_epochs(epochs) -> str` returning DuckDB SQL
+- Both execute SQL via `conn.execute(sql).fetch_arrow_table()` and write via `pq.write_table()`
 
 **`extract.py`** — orchestration:
-1. Connect and discover epochs (settled, max, conway_start)
-2. Filter to Conway-era only
-3. For each dataset: determine needed epochs, extract with tqdm progress
-4. `--full` flag deletes existing files before re-extracting
+1. Create DuckDB connection with all source tables registered
+2. Discover epochs (settled, max, conway_start)
+3. Filter to Conway-era only
+4. For each dataset: determine needed epochs, extract with tqdm progress
+5. `--full` flag deletes existing files before re-extracting
 
 **`views.py`** — creates DuckDB views:
 - Epoch-partitioned datasets: `read_parquet('.../*.parquet', hive_partitioning=true)`
 - Single-file datasets: `read_parquet('.../<name>.parquet')`
+- KPI views: `CREATE OR REPLACE VIEW` from `ALL_KPI_VIEWS` registry
 
 ## The 8 Datasets
 
 ### 1. `drep_epoch_stats` (epoch-partitioned, 12 columns)
 
-Per-DRep per-epoch delegation and voting stats. Joins `drep_dist` with `drep` (status via LATERAL), `drep_registration` (first registration epoch, metadata check), and `voting_procedure` (vote counts). Feeds KPIs: 1.3, 1.8, 2.1-2.3, 2.8, 2.10, 2.11.
+Per-DRep per-epoch delegation and voting stats. Uses CTEs with `ROW_NUMBER()` to find latest DRep status and registration info. Feeds KPIs: 1.3, 1.8, 2.1-2.3, 2.8, 2.10, 2.11.
 
 ### 2. `pool_epoch_stats` (epoch-partitioned, 9 columns)
 
-Per-pool per-epoch stats. Joins `pool` with `voting_procedure` (vote breakdown by YES/NO/ABSTAIN) and `delegation_vote` via `pool_registration.pool_owners` (default stance). Feeds KPIs: 3.1-3.5.
+Per-pool per-epoch stats. Joins `pool` with `voting_procedure` (vote breakdown by YES/NO/ABSTAIN) and `delegation_vote` via `pool_registration.pool_owners` (default stance, using `CAST(pool_owners AS VARCHAR[])` for JSON array parsing). Feeds KPIs: 3.1-3.5.
 
 ### 3. `gov_action_votes` (epoch-partitioned, 12 columns)
 
-Every individual vote record. Joins `voting_procedure` with `gov_action_proposal` for action metadata. Partitioned by `vote_epoch`. Feeds KPIs: 2.4, 2.5, 2.7, 2.9, 2.12, 3.4, 3.6, 4.2.
+Every individual vote record. Joins `voting_procedure` with `gov_action_proposal` for action metadata. Block times converted via `epoch(block_time)`. Feeds KPIs: 2.4, 2.5, 2.7, 2.9, 2.12, 3.4, 3.6, 4.2.
 
 ### 4. `gov_action_lifecycle` (single-file, 34 columns)
 
-Per-action lifecycle with full voting stats flattened from `voting_stats` JSONB (cc/drep/spo breakdowns and approval ratios). Custom `extract()` always re-fetches non-terminal actions. Deduplicates by `(tx_hash, index)`. Feeds KPIs: 1.1, 3.7, 4.1, 4.2, 4.5, 4.7, 4.8.
+Per-action lifecycle with full voting stats flattened from `voting_stats` JSON using `json_extract_string()`. Flat JSON keys (e.g. `$.cc_yes`, `$.drep_yes_vote_stake`). Custom `extract()` always re-fetches non-terminal actions. Deduplicates by `(tx_hash, index)`. Feeds KPIs: 1.1, 3.7, 4.1, 4.2, 4.5, 4.7, 4.8.
 
 ### 5. `epoch_summary` (single-file, 24 columns)
 
-Per-epoch context and denominators. Large multi-join query aggregating from `epoch`, `adapot`, `epoch_stake`, `drep_dist`, `pool`, `committee_member`, `committee`, `gov_action_proposal`, `gov_action_proposal_status`, `drep_registration`, and `local_treasury_withdrawal`. Feeds KPIs: 1.1, 1.3, 2.2, 3.1, 4.3, 5.2.
+Per-epoch context and denominators. Drives from `adapot` as the epoch base (since the `epoch` table is empty in yaci-store Parquet exports). Block and transaction counts derived from `block` and `transaction` tables. Treasury withdrawal count derived from `gov_action_proposal` + `gov_action_proposal_status` (enacted treasury withdrawal actions). Feeds KPIs: 1.1, 1.3, 2.2, 3.1, 4.3, 5.2.
 
 ### 6. `delegation_events` (single-file, 8 columns)
 
@@ -147,26 +184,27 @@ Raw delegation-vote events from the `delegation_vote` table. Feeds KPIs: 1.2, 1.
 
 ### 7. `cc_vote_details` (single-file, 12 columns)
 
-CC member votes with timing. Joins `voting_procedure` (CC voter types only) with `gov_action_proposal` and `committee_registration` for hot_key → cold_key resolution. Computes `time_to_vote_seconds`. Feeds KPIs: 5.1-5.4.
+CC member votes with timing. Joins `voting_procedure` (CC voter types only) with `gov_action_proposal` and `committee_registration` (latest hot_key → cold_key via `ROW_NUMBER()`). Feeds KPIs: 5.1-5.4.
 
 ### 8. `governance_params` (single-file, 22 columns)
 
-Governance-relevant protocol parameters per epoch from `epoch_param.params` JSONB. Extracts scalar fields directly and computes `numerator/denominator` ratios for all pool voting thresholds (`pvt_*`) and DRep voting thresholds (`dvt_*`). Feeds KPI 4.9 and contextual threshold display.
+Governance-relevant protocol parameters per epoch from `epoch_param.params` JSON. Uses `json_extract_string()` for scalar fields and computes `numerator/denominator` ratios for all pool voting thresholds (`pvt_*`) and DRep voting thresholds (`dvt_*`). Note: yaci-store JSON key names are `drep_voting_thresholds` (not `d_rep_voting_thresholds`) and `pvt_ppsecurity_group` / `dvt_ppnetwork_group` etc. (no underscore between `pp` and group name). Feeds KPI 4.9 and contextual threshold display.
 
 ## Design Decisions
 
-1. **Named SQL parameters** — all queries use `%(epoch)s` / `%(epochs)s` with dict params for psycopg3 compatibility.
-2. **Network-agnostic** — no hardcoded thresholds; governance thresholds extracted from `epoch_param.params` into `governance_params.parquet`.
-3. **Schema prefix** — connection sets `search_path=yaci_store,public` so queries reference tables directly.
-4. **JSONB flattened at extraction** — `voting_stats` and `epoch_param.params` are flattened into typed Parquet columns, not re-parsed at query time.
-5. **Conway-era filter** — `get_conway_start_epoch()` queries `MIN(epoch) FROM drep_dist` to skip pre-governance epochs automatically.
+1. **DuckDB-native** — all SQL is DuckDB dialect. No PostgreSQL dependency. Source tables are registered as views over `read_parquet()`.
+2. **CTEs over LATERAL** — DuckDB doesn't support `LATERAL` joins. All lookups use CTEs with `ROW_NUMBER()` window functions.
+3. **JSON via `json_extract_string()`** — DuckDB's JSON functions operate on VARCHAR columns. `voting_stats` and `epoch_param.params` are parsed at extraction time into typed Parquet columns.
+4. **Network-agnostic** — no hardcoded thresholds; governance thresholds extracted from `epoch_param.params`.
+5. **Conway-era filter** — `get_conway_start_epoch()` queries `MIN(epoch) FROM drep_dist` to skip pre-governance epochs.
 6. **Incremental by default** — only new/unsettled epochs processed. `--full` for complete re-extraction.
 7. **Empty epoch skip** — epoch-partitioned datasets write no file for epochs with zero rows.
-8. **Lifecycle dedup** — `gov_action_lifecycle` deduplicates by `(tx_hash, index)` primary key rather than by epoch, and always re-fetches actions that haven't reached terminal status.
+8. **Lifecycle dedup** — `gov_action_lifecycle` deduplicates by `(tx_hash, index)` primary key and always re-fetches non-terminal actions.
+9. **Epoch from adapot** — the `epoch` table is empty in yaci-store Parquet exports. Epoch boundaries are derived from the `block` table; financial data from `adapot`.
 
 ## KPI Analytic Views
 
-The second layer on top of the base Parquet views. Each KPI is a `CREATE OR REPLACE VIEW` in DuckDB that computes a per-epoch time-series from one or more base views. Created automatically by `create-views` — no CLI changes needed.
+The second layer on top of the base Parquet views. Each KPI is a `CREATE OR REPLACE VIEW` in DuckDB that computes a per-epoch time-series from one or more base views. Created automatically by `create-views`.
 
 ### Architecture
 
@@ -195,7 +233,7 @@ The second layer on top of the base Parquet views. Each KPI is a `CREATE OR REPL
 
 ## Superset Stack
 
-Docker Compose stack in `superset/` providing Apache Superset with DuckDB backend (mirrored from ys-to-parquet).
+Docker Compose stack in `superset/` providing Apache Superset with DuckDB backend.
 
 ```
 superset/
@@ -213,7 +251,3 @@ superset/
 - Database registered as `Cardano Governance (DuckDB)` with URI `duckdb:////data/governance.duckdb?access_mode=READ_ONLY`
 - Admin credentials: admin / admin
 - Start: `cd superset && docker compose up --build` → http://localhost:8088
-
-## Known Issues / Next Steps
-
-- **KPI 1.1 returns 0 rows** — `drep_yes_vote_stake` columns in `gov_action_lifecycle` appear to be all NULL. Needs investigation: check yaci-store `gov_action_proposal.voting_stats` JSONB contents, verify extraction JSONB field paths, and check yaci-store configuration for voting stats computation.

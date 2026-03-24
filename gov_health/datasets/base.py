@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -12,12 +13,8 @@ class EpochPartitionedDataset(ABC):
     name: str  # used as directory name under output/
 
     @abstractmethod
-    def schema(self) -> pa.Schema:
-        ...
-
-    @abstractmethod
-    def query_epoch(self, epoch: int) -> tuple[str, list]:
-        """Return (sql, params) for a single epoch."""
+    def query_epoch(self, epoch: int) -> str:
+        """Return a DuckDB SQL query for a single epoch."""
         ...
 
     def epoch_path(self, output_dir: Path, epoch: int) -> Path:
@@ -26,15 +23,15 @@ class EpochPartitionedDataset(ABC):
     def needs_extraction(self, output_dir: Path, epoch: int) -> bool:
         return not self.epoch_path(output_dir, epoch).exists()
 
-    def extract_epoch(self, conn, epoch: int, output_dir: Path, *, force: bool = False):
+    def extract_epoch(self, conn: duckdb.DuckDBPyConnection, epoch: int,
+                      output_dir: Path, *, force: bool = False):
         path = self.epoch_path(output_dir, epoch)
         if path.exists() and not force:
             return
-        sql, params = self.query_epoch(epoch)
-        rows = conn.execute(sql, params).fetchall()
-        if not rows:
-            return  # skip empty epochs
-        table = pa.Table.from_pylist(rows, schema=self.schema())
+        sql = self.query_epoch(epoch)
+        table = conn.execute(sql).fetch_arrow_table()
+        if table.num_rows == 0:
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(table, path)
 
@@ -45,12 +42,8 @@ class SingleFileDataset(ABC):
     name: str  # used as filename (without .parquet)
 
     @abstractmethod
-    def schema(self) -> pa.Schema:
-        ...
-
-    @abstractmethod
-    def query_epochs(self, epochs: list[int]) -> tuple[str, list]:
-        """Return (sql, params) for a batch of epochs."""
+    def query_epochs(self, epochs: list[int]) -> str:
+        """Return a DuckDB SQL query for a batch of epochs."""
         ...
 
     def file_path(self, output_dir: Path) -> Path:
@@ -63,9 +56,9 @@ class SingleFileDataset(ABC):
         table = pq.read_table(path, columns=["epoch"])
         return set(table.column("epoch").to_pylist())
 
-    def extract(self, conn, settled: list[int], max_epoch: int, output_dir: Path):
+    def extract(self, conn: duckdb.DuckDBPyConnection, settled: list[int],
+                max_epoch: int, output_dir: Path):
         existing = self.existing_epochs(output_dir)
-        # Need: all settled epochs not yet stored + current unsettled epoch
         new_epochs = sorted(set(settled) - existing)
         unsettled = max_epoch if max_epoch not in settled else None
 
@@ -76,22 +69,21 @@ class SingleFileDataset(ABC):
         if not epochs_to_fetch:
             return
 
-        sql, params = self.query_epochs(epochs_to_fetch)
-        rows = conn.execute(sql, params).fetchall()
-        if not rows:
+        sql = self.query_epochs(epochs_to_fetch)
+        table = conn.execute(sql).fetch_arrow_table()
+        if table.num_rows == 0:
             return
 
-        new_table = pa.Table.from_pylist(rows, schema=self.schema())
         path = self.file_path(output_dir)
 
         if path.exists():
-            old_table = pq.read_table(path, schema=self.schema())
-            fetched_epochs = pc.unique(new_table.column("epoch"))
+            old_table = pq.read_table(path)
+            fetched_epochs = pc.unique(table.column("epoch"))
             mask = pc.invert(pc.is_in(old_table.column("epoch"), value_set=fetched_epochs))
             old_table = old_table.filter(mask)
-            combined = pa.concat_tables([old_table, new_table])
+            combined = pa.concat_tables([old_table, table])
         else:
-            combined = new_table
+            combined = table
 
         path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(combined, path)

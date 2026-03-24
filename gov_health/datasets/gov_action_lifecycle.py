@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from gov_health.datasets.base import SingleFileDataset
 
@@ -6,109 +9,80 @@ from gov_health.datasets.base import SingleFileDataset
 class GovActionLifecycle(SingleFileDataset):
     name = "gov_action_lifecycle"
 
-    def schema(self) -> pa.Schema:
-        return pa.schema([
-            ("gov_action_tx_hash", pa.string()),
-            ("gov_action_index", pa.int32()),
-            ("type", pa.string()),
-            ("deposit", pa.int64()),
-            ("return_address", pa.string()),
-            ("anchor_url", pa.string()),
-            ("epoch_proposed", pa.int32()),
-            ("block_time_proposed", pa.int64()),
-            ("status", pa.string()),
-            ("epoch_resolved", pa.int32()),
-            ("cc_yes", pa.int32()),
-            ("cc_no", pa.int32()),
-            ("cc_abstain", pa.int32()),
-            ("cc_do_not_vote", pa.int32()),
-            ("cc_approval_ratio", pa.float64()),
-            ("drep_yes_vote_stake", pa.int64()),
-            ("drep_no_vote_stake", pa.int64()),
-            ("drep_abstain_vote_stake", pa.int64()),
-            ("drep_no_confidence_stake", pa.int64()),
-            ("drep_auto_abstain_stake", pa.int64()),
-            ("drep_do_not_vote_stake", pa.int64()),
-            ("drep_total_yes_stake", pa.int64()),
-            ("drep_total_no_stake", pa.int64()),
-            ("drep_total_abstain_stake", pa.int64()),
-            ("drep_approval_ratio", pa.float64()),
-            ("spo_yes_vote_stake", pa.int64()),
-            ("spo_no_vote_stake", pa.int64()),
-            ("spo_abstain_vote_stake", pa.int64()),
-            ("spo_do_not_vote_stake", pa.int64()),
-            ("spo_total_yes_stake", pa.int64()),
-            ("spo_total_no_stake", pa.int64()),
-            ("spo_total_abstain_stake", pa.int64()),
-            ("spo_approval_ratio", pa.float64()),
-            # epoch column used for incremental tracking
-            ("epoch", pa.int32()),
-        ])
-
-    def query_epochs(self, epochs: list[int]) -> tuple[str, list]:
-        sql = """
+    def query_epochs(self, epochs: list[int]) -> str:
+        epoch_list = ",".join(str(e) for e in epochs)
+        return f"""
+            WITH latest_status AS (
+                SELECT
+                    gov_action_tx_hash,
+                    gov_action_index,
+                    status,
+                    voting_stats,
+                    epoch,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY gov_action_tx_hash, gov_action_index
+                        ORDER BY epoch DESC
+                    ) AS rn
+                FROM gov_action_proposal_status
+            ),
+            resolved AS (
+                SELECT
+                    gov_action_tx_hash,
+                    gov_action_index,
+                    status,
+                    voting_stats,
+                    CASE WHEN status IN ('RATIFIED', 'EXPIRED', 'ENACTED', 'DROPPED')
+                         THEN epoch ELSE NULL END AS epoch_resolved
+                FROM latest_status
+                WHERE rn = 1
+            )
             SELECT
-              gap.tx_hash AS gov_action_tx_hash,
-              gap.idx AS gov_action_index,
-              gap.type,
-              gap.deposit,
-              gap.return_address,
-              gap.anchor_url,
-              gap.epoch AS epoch_proposed,
-              gap.block_time AS block_time_proposed,
-              s.status,
-              s.epoch_resolved,
-              -- CC voting stats
-              (s.voting_stats->'cc'->>'yes')::int AS cc_yes,
-              (s.voting_stats->'cc'->>'no')::int AS cc_no,
-              (s.voting_stats->'cc'->>'abstain')::int AS cc_abstain,
-              (s.voting_stats->'cc'->>'do_not_vote')::int AS cc_do_not_vote,
-              (s.voting_stats->'cc'->>'approval_ratio')::float8 AS cc_approval_ratio,
-              -- DRep voting stats
-              (s.voting_stats->'drep'->>'yes_vote_stake')::bigint AS drep_yes_vote_stake,
-              (s.voting_stats->'drep'->>'no_vote_stake')::bigint AS drep_no_vote_stake,
-              (s.voting_stats->'drep'->>'abstain_vote_stake')::bigint AS drep_abstain_vote_stake,
-              (s.voting_stats->'drep'->>'no_confidence_stake')::bigint AS drep_no_confidence_stake,
-              (s.voting_stats->'drep'->>'auto_abstain_stake')::bigint AS drep_auto_abstain_stake,
-              (s.voting_stats->'drep'->>'do_not_vote_stake')::bigint AS drep_do_not_vote_stake,
-              (s.voting_stats->'drep'->>'total_yes_stake')::bigint AS drep_total_yes_stake,
-              (s.voting_stats->'drep'->>'total_no_stake')::bigint AS drep_total_no_stake,
-              (s.voting_stats->'drep'->>'total_abstain_stake')::bigint AS drep_total_abstain_stake,
-              (s.voting_stats->'drep'->>'approval_ratio')::float8 AS drep_approval_ratio,
-              -- SPO voting stats
-              (s.voting_stats->'spo'->>'yes_vote_stake')::bigint AS spo_yes_vote_stake,
-              (s.voting_stats->'spo'->>'no_vote_stake')::bigint AS spo_no_vote_stake,
-              (s.voting_stats->'spo'->>'abstain_vote_stake')::bigint AS spo_abstain_vote_stake,
-              (s.voting_stats->'spo'->>'do_not_vote_stake')::bigint AS spo_do_not_vote_stake,
-              (s.voting_stats->'spo'->>'total_yes_stake')::bigint AS spo_total_yes_stake,
-              (s.voting_stats->'spo'->>'total_no_stake')::bigint AS spo_total_no_stake,
-              (s.voting_stats->'spo'->>'total_abstain_stake')::bigint AS spo_total_abstain_stake,
-              (s.voting_stats->'spo'->>'approval_ratio')::float8 AS spo_approval_ratio,
-              -- epoch for incremental tracking (use latest status epoch, or proposed epoch)
-              COALESCE(s.epoch_resolved, gap.epoch) AS epoch
+                gap.tx_hash AS gov_action_tx_hash,
+                gap.idx::INT AS gov_action_index,
+                gap.type,
+                gap.deposit,
+                gap.return_address,
+                gap.anchor_url,
+                gap.epoch::INT AS epoch_proposed,
+                epoch(gap.block_time)::BIGINT AS block_time_proposed,
+                r.status,
+                r.epoch_resolved::INT AS epoch_resolved,
+                -- CC voting stats (flat JSON keys)
+                CAST(json_extract_string(r.voting_stats, '$.cc_yes') AS INT) AS cc_yes,
+                CAST(json_extract_string(r.voting_stats, '$.cc_no') AS INT) AS cc_no,
+                CAST(json_extract_string(r.voting_stats, '$.cc_abstain') AS INT) AS cc_abstain,
+                CAST(json_extract_string(r.voting_stats, '$.cc_do_not_vote') AS INT) AS cc_do_not_vote,
+                CAST(json_extract_string(r.voting_stats, '$.cc_approval_ratio') AS DOUBLE) AS cc_approval_ratio,
+                -- DRep voting stats
+                CAST(json_extract_string(r.voting_stats, '$.drep_yes_vote_stake') AS BIGINT) AS drep_yes_vote_stake,
+                CAST(json_extract_string(r.voting_stats, '$.drep_no_vote_stake') AS BIGINT) AS drep_no_vote_stake,
+                CAST(json_extract_string(r.voting_stats, '$.drep_abstain_vote_stake') AS BIGINT) AS drep_abstain_vote_stake,
+                CAST(json_extract_string(r.voting_stats, '$.drep_no_confidence_stake') AS BIGINT) AS drep_no_confidence_stake,
+                CAST(json_extract_string(r.voting_stats, '$.drep_auto_abstain_stake') AS BIGINT) AS drep_auto_abstain_stake,
+                CAST(json_extract_string(r.voting_stats, '$.drep_do_not_vote_stake') AS BIGINT) AS drep_do_not_vote_stake,
+                CAST(json_extract_string(r.voting_stats, '$.drep_total_yes_stake') AS BIGINT) AS drep_total_yes_stake,
+                CAST(json_extract_string(r.voting_stats, '$.drep_total_no_stake') AS BIGINT) AS drep_total_no_stake,
+                CAST(json_extract_string(r.voting_stats, '$.drep_total_abstain_stake') AS BIGINT) AS drep_total_abstain_stake,
+                CAST(json_extract_string(r.voting_stats, '$.drep_approval_ratio') AS DOUBLE) AS drep_approval_ratio,
+                -- SPO voting stats
+                CAST(json_extract_string(r.voting_stats, '$.spo_yes_vote_stake') AS BIGINT) AS spo_yes_vote_stake,
+                CAST(json_extract_string(r.voting_stats, '$.spo_no_vote_stake') AS BIGINT) AS spo_no_vote_stake,
+                CAST(json_extract_string(r.voting_stats, '$.spo_abstain_vote_stake') AS BIGINT) AS spo_abstain_vote_stake,
+                CAST(json_extract_string(r.voting_stats, '$.spo_do_not_vote_stake') AS BIGINT) AS spo_do_not_vote_stake,
+                CAST(json_extract_string(r.voting_stats, '$.spo_total_yes_stake') AS BIGINT) AS spo_total_yes_stake,
+                CAST(json_extract_string(r.voting_stats, '$.spo_total_no_stake') AS BIGINT) AS spo_total_no_stake,
+                CAST(json_extract_string(r.voting_stats, '$.spo_total_abstain_stake') AS BIGINT) AS spo_total_abstain_stake,
+                CAST(json_extract_string(r.voting_stats, '$.spo_approval_ratio') AS DOUBLE) AS spo_approval_ratio,
+                COALESCE(r.epoch_resolved, gap.epoch)::INT AS epoch
             FROM gov_action_proposal gap
-            LEFT JOIN LATERAL (
-              SELECT
-                gps.status,
-                gps.voting_stats,
-                CASE WHEN gps.status IN ('RATIFIED', 'EXPIRED', 'ENACTED', 'DROPPED')
-                     THEN gps.epoch ELSE NULL END AS epoch_resolved
-              FROM gov_action_proposal_status gps
-              WHERE gps.gov_action_tx_hash = gap.tx_hash
-                AND gps.gov_action_index = gap.idx
-              ORDER BY gps.epoch DESC LIMIT 1
-            ) s ON true
-            WHERE gap.epoch = ANY(%(epochs)s)
-               OR (s.status IS NULL OR s.status NOT IN ('RATIFIED', 'EXPIRED', 'ENACTED', 'DROPPED'))
+            LEFT JOIN resolved r
+              ON r.gov_action_tx_hash = gap.tx_hash AND r.gov_action_index = gap.idx
+            WHERE gap.epoch IN ({epoch_list})
+               OR (r.status IS NULL OR r.status NOT IN ('RATIFIED', 'EXPIRED', 'ENACTED', 'DROPPED'))
         """
-        return sql, {"epochs": epochs}
 
     def extract(self, conn, settled: list[int], max_epoch: int, output_dir):
         """Override: for lifecycle, always re-fetch actions with non-terminal status."""
-        from pathlib import Path
-        import pyarrow.compute as pc
-        import pyarrow.parquet as pq
-
         output_dir = Path(output_dir)
         existing = self.existing_epochs(output_dir)
         new_epochs = sorted(set(settled) - existing)
@@ -120,18 +94,17 @@ class GovActionLifecycle(SingleFileDataset):
 
         # For lifecycle, we pass epochs but the query also re-fetches ACTIVE actions
         if not epochs_to_fetch:
-            epochs_to_fetch = [max_epoch]  # still re-fetch active actions
+            epochs_to_fetch = [max_epoch]
 
-        sql, params = self.query_epochs(epochs_to_fetch)
-        rows = conn.execute(sql, params).fetchall()
-        if not rows:
+        sql = self.query_epochs(epochs_to_fetch)
+        new_table = conn.execute(sql).fetch_arrow_table()
+        if new_table.num_rows == 0:
             return
 
-        new_table = pa.Table.from_pylist(rows, schema=self.schema())
         path = self.file_path(output_dir)
 
         if path.exists():
-            old_table = pq.read_table(path, schema=self.schema())
+            old_table = pq.read_table(path)
             # Deduplicate by (gov_action_tx_hash, gov_action_index)
             new_keys = set()
             tx_col = new_table.column("gov_action_tx_hash").to_pylist()

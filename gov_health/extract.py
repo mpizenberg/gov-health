@@ -47,7 +47,6 @@ def run(*, only: list[str] | None = None, output_dir: str = "output", full: bool
         elif isinstance(ds, SingleFileDataset):
             print(f"  {ds.name}: extracting...")
             if full:
-                # Remove existing file to force full re-extraction
                 path = ds.file_path(output)
                 if path.exists():
                     path.unlink()

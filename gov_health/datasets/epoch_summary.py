@@ -1,119 +1,138 @@
-import pyarrow as pa
-
 from gov_health.datasets.base import SingleFileDataset
 
 
 class EpochSummary(SingleFileDataset):
     name = "epoch_summary"
 
-    def schema(self) -> pa.Schema:
-        return pa.schema([
-            ("epoch", pa.int32()),
-            ("treasury", pa.int64()),
-            ("reserves", pa.int64()),
-            ("circulation", pa.int64()),
-            ("utxo", pa.int64()),
-            ("fees", pa.int64()),
-            ("total_active_stake", pa.int64()),
-            ("total_drep_delegated", pa.int64()),
-            ("total_drep_delegated_non_abstain", pa.int64()),
-            ("total_drep_delegated_no_confidence", pa.int64()),
-            ("active_drep_count", pa.int32()),
-            ("active_pool_count", pa.int32()),
-            ("cc_member_count", pa.int32()),
-            ("cc_threshold", pa.float64()),
-            ("block_count", pa.int32()),
-            ("tx_count", pa.int64()),
-            ("epoch_start_time", pa.int64()),
-            ("epoch_end_time", pa.int64()),
-            ("gov_actions_proposed", pa.int32()),
-            ("gov_actions_ratified", pa.int32()),
-            ("gov_actions_expired", pa.int32()),
-            ("drep_registrations", pa.int32()),
-            ("drep_retirements", pa.int32()),
-            ("treasury_withdrawal_total", pa.int64()),
-        ])
-
-    def query_epochs(self, epochs: list[int]) -> tuple[str, list]:
-        sql = """
+    def query_epochs(self, epochs: list[int]) -> str:
+        epoch_list = ",".join(str(e) for e in epochs)
+        return f"""
+            WITH epoch_base AS (
+                SELECT epoch FROM adapot WHERE epoch IN ({epoch_list})
+            ),
+            block_stats AS (
+                SELECT epoch,
+                    COUNT(*) AS block_count,
+                    MIN(epoch(block_time))::BIGINT AS epoch_start_time,
+                    MAX(epoch(block_time))::BIGINT AS epoch_end_time
+                FROM block
+                WHERE epoch IN ({epoch_list})
+                GROUP BY epoch
+            ),
+            tx_stats AS (
+                SELECT epoch, COUNT(*) AS tx_count
+                FROM transaction
+                WHERE epoch IN ({epoch_list})
+                GROUP BY epoch
+            ),
+            stake_agg AS (
+                SELECT epoch, SUM(amount)::BIGINT AS total_active_stake
+                FROM epoch_stake
+                WHERE epoch IN ({epoch_list})
+                GROUP BY epoch
+            ),
+            dd_agg AS (
+                SELECT epoch,
+                    SUM(amount)::BIGINT AS total_drep_delegated,
+                    (SUM(amount) FILTER (WHERE drep_type NOT IN ('ABSTAIN')))::BIGINT AS total_drep_delegated_non_abstain,
+                    (SUM(amount) FILTER (WHERE drep_type = 'NO_CONFIDENCE'))::BIGINT AS total_drep_delegated_no_confidence,
+                    (COUNT(DISTINCT drep_hash) FILTER (WHERE drep_type NOT IN ('ABSTAIN', 'NO_CONFIDENCE')))::INT AS active_drep_count
+                FROM drep_dist
+                WHERE epoch IN ({epoch_list})
+                GROUP BY epoch
+            ),
+            pool_agg AS (
+                SELECT epoch, COUNT(*)::INT AS active_pool_count
+                FROM pool
+                WHERE status != 'RETIRED' AND epoch IN ({epoch_list})
+                GROUP BY epoch
+            ),
+            cc_info AS (
+                SELECT
+                    eb.epoch,
+                    COUNT(cmm.hash)::INT AS cc_member_count,
+                    c.threshold AS cc_threshold
+                FROM epoch_base eb
+                LEFT JOIN committee_member cmm
+                    ON cmm.start_epoch <= eb.epoch
+                    AND (cmm.expired_epoch IS NULL OR cmm.expired_epoch > eb.epoch)
+                LEFT JOIN (
+                    SELECT threshold, epoch,
+                           ROW_NUMBER() OVER (ORDER BY epoch DESC) AS rn
+                    FROM committee
+                ) c ON c.rn = 1
+                GROUP BY eb.epoch, c.threshold
+            ),
+            ga_proposed AS (
+                SELECT epoch, COUNT(*)::INT AS gov_actions_proposed
+                FROM gov_action_proposal
+                WHERE epoch IN ({epoch_list})
+                GROUP BY epoch
+            ),
+            ga_status_agg AS (
+                SELECT epoch,
+                    (COUNT(*) FILTER (WHERE status = 'RATIFIED'))::INT AS gov_actions_ratified,
+                    (COUNT(*) FILTER (WHERE status = 'EXPIRED'))::INT AS gov_actions_expired
+                FROM gov_action_proposal_status
+                WHERE epoch IN ({epoch_list})
+                GROUP BY epoch
+            ),
+            drep_reg AS (
+                SELECT epoch,
+                    (COUNT(*) FILTER (WHERE type = 'REG_DREP_CERT'))::INT AS drep_registrations,
+                    (COUNT(*) FILTER (WHERE type = 'UNREG_DREP_CERT'))::INT AS drep_retirements
+                FROM drep_registration
+                WHERE epoch IN ({epoch_list})
+                GROUP BY epoch
+            ),
+            tw AS (
+                SELECT gap.epoch,
+                    COUNT(*)::BIGINT AS treasury_withdrawal_total
+                FROM gov_action_proposal gap
+                JOIN gov_action_proposal_status gps
+                    ON gps.gov_action_tx_hash = gap.tx_hash
+                    AND gps.gov_action_index = gap.idx
+                    AND gps.status = 'ENACTED'
+                WHERE gap.type = 'TREASURY_WITHDRAWALS_ACTION'
+                  AND gps.epoch IN ({epoch_list})
+                GROUP BY gap.epoch
+            )
             SELECT
-              e.number AS epoch,
-              ap.treasury, ap.reserves, ap.circulation, ap.utxo, ap.fees,
-              stk.total_active_stake,
-              dd_agg.total_drep_delegated,
-              dd_agg.total_drep_delegated_non_abstain,
-              dd_agg.total_drep_delegated_no_confidence,
-              dd_agg.active_drep_count,
-              pool_agg.active_pool_count,
-              cm_agg.cc_member_count,
-              cm_agg.cc_threshold,
-              e.block_count,
-              e.transaction_count AS tx_count,
-              e.start_time AS epoch_start_time,
-              e.end_time AS epoch_end_time,
-              COALESCE(ga_agg.gov_actions_proposed, 0) AS gov_actions_proposed,
-              COALESCE(ga_agg.gov_actions_ratified, 0) AS gov_actions_ratified,
-              COALESCE(ga_agg.gov_actions_expired, 0) AS gov_actions_expired,
-              COALESCE(drep_reg.drep_registrations, 0) AS drep_registrations,
-              COALESCE(drep_reg.drep_retirements, 0) AS drep_retirements,
-              COALESCE(tw.treasury_withdrawal_total, 0) AS treasury_withdrawal_total
-            FROM epoch e
-            LEFT JOIN adapot ap ON ap.epoch = e.number
-            LEFT JOIN (
-              SELECT epoch, SUM(amount) AS total_active_stake
-              FROM epoch_stake GROUP BY epoch
-            ) stk ON stk.epoch = e.number
-            LEFT JOIN (
-              SELECT epoch,
-                SUM(amount) AS total_drep_delegated,
-                SUM(amount) FILTER (WHERE drep_type NOT IN ('ABSTAIN')) AS total_drep_delegated_non_abstain,
-                SUM(amount) FILTER (WHERE drep_type = 'NO_CONFIDENCE') AS total_drep_delegated_no_confidence,
-                COUNT(DISTINCT drep_hash) FILTER (WHERE drep_type NOT IN ('ABSTAIN','NO_CONFIDENCE')) AS active_drep_count
-              FROM drep_dist GROUP BY epoch
-            ) dd_agg ON dd_agg.epoch = e.number
-            LEFT JOIN (
-              SELECT epoch, COUNT(*) AS active_pool_count
-              FROM pool WHERE status != 'RETIRED'
-              GROUP BY epoch
-            ) pool_agg ON pool_agg.epoch = e.number
-            LEFT JOIN LATERAL (
-              SELECT
-                COUNT(*) AS cc_member_count,
-                c.threshold AS cc_threshold
-              FROM committee_member cmm
-              CROSS JOIN LATERAL (
-                SELECT threshold
-                FROM committee ORDER BY epoch DESC LIMIT 1
-              ) c
-              WHERE cmm.start_epoch <= e.number
-                AND (cmm.expired_epoch IS NULL OR cmm.expired_epoch > e.number)
-              GROUP BY c.threshold
-            ) cm_agg ON true
-            LEFT JOIN (
-              SELECT epoch,
-                COUNT(*) AS gov_actions_proposed,
-                COUNT(*) FILTER (WHERE tx_hash IN (
-                  SELECT gov_action_tx_hash FROM gov_action_proposal_status
-                  WHERE status = 'RATIFIED' AND epoch = gap_inner.epoch
-                )) AS gov_actions_ratified,
-                COUNT(*) FILTER (WHERE tx_hash IN (
-                  SELECT gov_action_tx_hash FROM gov_action_proposal_status
-                  WHERE status = 'EXPIRED' AND epoch = gap_inner.epoch
-                )) AS gov_actions_expired
-              FROM gov_action_proposal gap_inner
-              GROUP BY epoch
-            ) ga_agg ON ga_agg.epoch = e.number
-            LEFT JOIN (
-              SELECT epoch,
-                COUNT(*) FILTER (WHERE type = 'REG') AS drep_registrations,
-                COUNT(*) FILTER (WHERE type = 'UNREG') AS drep_retirements
-              FROM drep_registration GROUP BY epoch
-            ) drep_reg ON drep_reg.epoch = e.number
-            LEFT JOIN (
-              SELECT epoch, SUM(amount) AS treasury_withdrawal_total
-              FROM local_treasury_withdrawal GROUP BY epoch
-            ) tw ON tw.epoch = e.number
-            WHERE e.number = ANY(%(epochs)s)
-            ORDER BY e.number
+                eb.epoch::INT AS epoch,
+                ap.treasury::BIGINT AS treasury,
+                ap.reserves::BIGINT AS reserves,
+                ap.circulation::BIGINT AS circulation,
+                ap.utxo::BIGINT AS utxo,
+                ap.fees::BIGINT AS fees,
+                stk.total_active_stake,
+                dd.total_drep_delegated,
+                dd.total_drep_delegated_non_abstain,
+                dd.total_drep_delegated_no_confidence,
+                dd.active_drep_count,
+                pa.active_pool_count,
+                ci.cc_member_count,
+                ci.cc_threshold,
+                bs.block_count::INT AS block_count,
+                ts.tx_count::BIGINT AS tx_count,
+                bs.epoch_start_time,
+                bs.epoch_end_time,
+                COALESCE(gp.gov_actions_proposed, 0)::INT AS gov_actions_proposed,
+                COALESCE(gs.gov_actions_ratified, 0)::INT AS gov_actions_ratified,
+                COALESCE(gs.gov_actions_expired, 0)::INT AS gov_actions_expired,
+                COALESCE(dr.drep_registrations, 0)::INT AS drep_registrations,
+                COALESCE(dr.drep_retirements, 0)::INT AS drep_retirements,
+                COALESCE(tw.treasury_withdrawal_total, 0)::BIGINT AS treasury_withdrawal_total
+            FROM epoch_base eb
+            LEFT JOIN adapot ap ON ap.epoch = eb.epoch
+            LEFT JOIN stake_agg stk ON stk.epoch = eb.epoch
+            LEFT JOIN dd_agg dd ON dd.epoch = eb.epoch
+            LEFT JOIN pool_agg pa ON pa.epoch = eb.epoch
+            LEFT JOIN cc_info ci ON ci.epoch = eb.epoch
+            LEFT JOIN block_stats bs ON bs.epoch = eb.epoch
+            LEFT JOIN tx_stats ts ON ts.epoch = eb.epoch
+            LEFT JOIN ga_proposed gp ON gp.epoch = eb.epoch
+            LEFT JOIN ga_status_agg gs ON gs.epoch = eb.epoch
+            LEFT JOIN drep_reg dr ON dr.epoch = eb.epoch
+            LEFT JOIN tw ON tw.epoch = eb.epoch
+            ORDER BY eb.epoch
         """
-        return sql, {"epochs": epochs}

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import duckdb
+
 from gov_health.kpis import ALL_KPI_VIEWS
 
 
@@ -21,13 +23,6 @@ SINGLE_FILE = [
 
 
 def create_views(*, parquet_dir: str = "output", db_path: str = "output/governance.duckdb"):
-    try:
-        import duckdb
-    except ImportError:
-        raise SystemExit(
-            "duckdb is required for create-views. Install with: pip install 'gov-health[duckdb]'"
-        )
-
     parquet = Path(parquet_dir).resolve()
     conn = duckdb.connect(db_path)
 
