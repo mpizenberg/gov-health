@@ -1,7 +1,9 @@
 from gov_health.kpis.category_1 import CATEGORY_1_VIEWS
+from gov_health.kpis.chain_dashboard import CHAIN_DASHBOARD_VIEWS
 
 ALL_KPI_VIEWS = [
     *CATEGORY_1_VIEWS,
+    *CHAIN_DASHBOARD_VIEWS,
     # *CATEGORY_2_VIEWS,  # DRep Performance — future
     # *CATEGORY_3_VIEWS,  # SPO Participation — future
     # *CATEGORY_4_VIEWS,  # Governance Outcomes — future

@@ -18,7 +18,7 @@ if os.path.exists(DB):
 con = duckdb.connect(DB)
 count = 0
 
-# Directories containing .parquet files -> epoch-partitioned views
+# Directories containing .parquet files -> epoch-partitioned output views
 for d in sorted(BASE.iterdir()):
     if d.is_dir() and g.glob(str(d / '*.parquet')):
         parquet_glob = f'{d}/*.parquet'
@@ -38,10 +38,21 @@ for f in sorted(BASE.glob('*.parquet')):
     count += 1
 
 # KPI analytic views (imported from mounted gov_health package)
+# Chain dashboard views are already materialized as parquet files in /data,
+# so we skip their SQL and point at the parquet files instead.
 sys.path.insert(0, '/app')
 from gov_health.kpis import ALL_KPI_VIEWS
+from gov_health.kpis.chain_dashboard import CHAIN_DASHBOARD_VIEWS
+materialized = {n for n, _ in CHAIN_DASHBOARD_VIEWS}
 for name, sql in ALL_KPI_VIEWS:
-    con.execute(sql)
+    pq_file = BASE / f'{name}.parquet'
+    if name in materialized and pq_file.exists():
+        con.execute(
+            f\"CREATE OR REPLACE VIEW {name} AS \"
+            f\"SELECT * FROM read_parquet('{pq_file}')\"
+        )
+    else:
+        con.execute(sql)
     count += 1
 
 con.close()
